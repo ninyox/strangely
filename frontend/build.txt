@@ -1,0 +1,1 @@
+ rsync -avz --delete build/client/ glo@153.75.251.218:/var/www/strg/

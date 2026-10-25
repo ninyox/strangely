@@ -1,0 +1,8 @@
+# Secrets and local settings. Only .env.example is committed.
+.env
+
+# Build output and local scratch space.
+/strgback
+/tmp/
+
+.DS_Store
