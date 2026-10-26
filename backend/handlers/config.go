@@ -47,7 +47,8 @@ func (a *API) PublicConfig(c *gin.Context) {
 
 // buildIceServers turns configuration into the list the browser receives. A
 // STUN-only setup is perfectly usable locally; TURN is what makes calls work
-// across restrictive NATs in production.
+// across restrictive NATs in production, and every TURN URL is handed over in a
+// single entry because they all share one credential.
 func buildIceServers(cfg config.ICEConfig) []iceServerPayload {
 	servers := make([]iceServerPayload, 0, 2)
 
@@ -55,7 +56,7 @@ func buildIceServers(cfg config.ICEConfig) []iceServerPayload {
 		servers = append(servers, iceServerPayload{URLs: cfg.STUNURLs})
 	}
 
-	if cfg.TURNURL == "" {
+	if len(cfg.TURNURLs) == 0 {
 		return servers
 	}
 
@@ -64,18 +65,20 @@ func buildIceServers(cfg config.ICEConfig) []iceServerPayload {
 	if cfg.TURNSharedSecret != "" {
 		username, credential := turnCredentials(cfg, time.Now().UTC())
 		servers = append(servers, iceServerPayload{
-			URLs:       []string{cfg.TURNURL},
+			URLs:       cfg.TURNURLs,
 			Username:   username,
 			Credential: credential,
 		})
 		return servers
 	}
 
-	// Fallback for a TURN server that only supports static credentials.
-	// Documented in README.md as a development convenience.
+	// Fallback for a TURN service that only offers static credentials, such as
+	// a hosted relay. Documented in README.md: the credential is handed to
+	// every visitor, so a self-hosted TURN with a shared secret is better once
+	// the relay matters.
 	if cfg.TURNUsername != "" && cfg.TURNCredential != "" {
 		servers = append(servers, iceServerPayload{
-			URLs:       []string{cfg.TURNURL},
+			URLs:       cfg.TURNURLs,
 			Username:   cfg.TURNUsername,
 			Credential: cfg.TURNCredential,
 		})

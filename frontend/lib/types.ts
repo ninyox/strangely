@@ -60,6 +60,28 @@ export type IceServer = {
   credential?: string;
 };
 
+/**
+ * What a browser's peer connection looked like when it gave up.
+ *
+ * It is reported with the goodbye that ends a call whose media never arrived,
+ * and logged by the backend. It is the only way to tell, from the server side,
+ * whether the candidates crossed at all (`remoteCandidates: 0` means they did
+ * not) or whether they crossed and simply never paired (which is NAT, and needs
+ * TURN). Nothing here is trusted: the server logs it and nothing else.
+ */
+export type PeerDiagnostics = {
+  ice: RTCIceConnectionState;
+  connection: RTCPeerConnectionState;
+  /** Candidates this side gathered. */
+  localCandidates: number;
+  /** Candidates received from the partner. */
+  remoteCandidates: number;
+  /** Whether the partner's offer or answer ever arrived. */
+  remoteDescription: boolean;
+  /** How long the peer connection was alive. */
+  elapsedMs: number;
+};
+
 export type PublicConfig = {
   iceServers: IceServer[];
   skipLockSeconds: number;

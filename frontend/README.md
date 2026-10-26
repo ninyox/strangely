@@ -42,7 +42,7 @@ app/
     stage-preview.tsx      the call stage in its waiting state
     safety-section.tsx     the clay band
     closing-cta.tsx        the signal band
-    call-stage.tsx         remote video, local PiP, state strip
+    call-stage.tsx         remote video, local PiP, state strip, full screen
     call-controls.tsx      the sticky control bar
     countdown-ring.tsx     the Skip lock, drawn
     state-panels.tsx       searching, preparing, failed, ended
@@ -51,6 +51,7 @@ lib/
   api.ts                   typed API client (one ApiError shape)
   call.tsx                 the call state machine
   config.ts                the single API base URL
+  fullscreen.ts            native full screen, with a filled-page fallback
   media.tsx                getUserMedia with honest failure states
   session.tsx              the anonymous visit
   signaling.ts             WebSocket client with reconnect

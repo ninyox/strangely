@@ -1,0 +1,8 @@
+# Go workspace file. This exists so gopls/Zed resolve `backend` as a module
+# when the editor is opened at the repo root (strg/). Without it, gopls falls
+# back to a temp-modfile `go mod tidy` loop and pins the CPU.
+# Machine-local, so not committed.
+go.work
+go.work.sum
+
+.DS_Store

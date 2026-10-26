@@ -24,6 +24,10 @@ export class SignalingClient {
   private closedByUs = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
+  // Callers that are waiting for the socket to open (see waitForOpen).
+  private openWaiters: Array<{ resolve: (opened: boolean) => void; timer: ReturnType<typeof setTimeout> }> =
+    [];
+
   constructor(
     private readonly url: string,
     private readonly handlers: SignalingHandlers,
@@ -46,6 +50,7 @@ export class SignalingClient {
 
     socket.onopen = () => {
       this.retries = 0;
+      this.settleWaiters(true);
       this.handlers.onOpen();
     };
 
@@ -73,6 +78,9 @@ export class SignalingClient {
         const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** this.retries);
         this.retries += 1;
         this.timer = setTimeout(() => this.connect(), delay);
+      } else {
+        // Out of retries: nothing is going to open, so nobody waits forever.
+        this.settleWaiters(false);
       }
     };
 
@@ -83,6 +91,32 @@ export class SignalingClient {
 
   isOpen(): boolean {
     return this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Resolve once the socket is open, or with false when it cannot be opened
+   * inside the timeout.
+   *
+   * Matching waits for this. A session that is in the queue (or in a match)
+   * without a live socket cannot be reached at all: the server would pair it
+   * with somebody, and that somebody would sit in front of a call that can
+   * never be answered.
+   */
+  waitForOpen(timeoutMs = 6000): Promise<boolean> {
+    if (this.isOpen()) {
+      return Promise.resolve(true);
+    }
+
+    return new Promise<boolean>((resolve) => {
+      const waiter = {
+        resolve,
+        timer: setTimeout(() => {
+          this.openWaiters = this.openWaiters.filter((entry) => entry !== waiter);
+          resolve(false);
+        }, timeoutMs),
+      };
+      this.openWaiters.push(waiter);
+    });
   }
 
   /** Send one message. Anything sent while the socket is down is dropped. */
@@ -98,8 +132,19 @@ export class SignalingClient {
   close(): void {
     this.closedByUs = true;
     this.clearTimer();
+    this.settleWaiters(false);
     this.socket?.close();
     this.socket = null;
+  }
+
+  private settleWaiters(opened: boolean) {
+    const waiters = this.openWaiters;
+    this.openWaiters = [];
+
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(opened);
+    }
   }
 
   private clearTimer() {

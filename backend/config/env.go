@@ -10,10 +10,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// Config is everything Strangerly reads from the environment. Every field has a
-// development friendly default so the backend runs with no .env at all; the
-// values that matter in production (origins, cookies, TURN) are documented in
-// .env.example and README.md.
 type Config struct {
 	// Environment is "development" or "production". It drives cookie security
 	// and log verbosity, never behaviour the user can see.
@@ -59,9 +55,14 @@ type Config struct {
 // alone does not guarantee connectivity across every NAT, so TURN is supported
 // and optional; when a shared secret is configured the backend mints
 // short-lived credentials instead of shipping static ones to the client.
+//
+// TURNURLs is a list on purpose: a hosted relay publishes the same relay over
+// several transports (UDP, TCP, and TLS on 443 for networks that allow nothing
+// else), and a browser needs all of them to stand a chance on a hostile
+// network.
 type ICEConfig struct {
 	STUNURLs          []string
-	TURNURL           string
+	TURNURLs          []string
 	TURNUsername      string
 	TURNCredential    string
 	TURNSharedSecret  string
@@ -82,7 +83,12 @@ type RateLimitConfig struct {
 var App Config
 
 // LoadEnv reads .env (when present) and the process environment into App.
+//
+// .env.local is read first and wins: it is how a development machine overrides
+// a .env that is written for the deployed service, without editing the file
+// that gets deployed. A deployed host must not have one.
 func LoadEnv() {
+	_ = godotenv.Load(".env.local")
 	_ = godotenv.Load()
 
 	App = Config{
@@ -107,7 +113,10 @@ func LoadEnv() {
 				"STUN_URLS",
 				"stun:stun.l.google.com:19302",
 			)),
-			TURNURL:           os.Getenv("TURN_URL"),
+			// TURN_URLS takes a comma separated list; TURN_URL is the single
+			// URL form this service used to read, kept so an existing .env
+			// keeps working.
+			TURNURLs:          splitList(getEnvWithDefault("TURN_URLS", os.Getenv("TURN_URL"))),
 			TURNUsername:      os.Getenv("TURN_USERNAME"),
 			TURNCredential:    os.Getenv("TURN_CREDENTIAL"),
 			TURNSharedSecret:  os.Getenv("TURN_SHARED_SECRET"),

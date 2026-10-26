@@ -1,4 +1,4 @@
-import type { IceServer } from "./types";
+import type { IceServer, PeerDiagnostics } from "./types";
 
 /**
  * One RTCPeerConnection for one match.
@@ -20,6 +20,12 @@ export class PeerSession {
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private remoteDescriptionSet = false;
   private closed = false;
+
+  // Counted so a failed call can say what it saw: candidates that never crossed
+  // and candidates that crossed but never paired look identical on screen.
+  private localCandidates = 0;
+  private remoteCandidates = 0;
+  private readonly startedAt = Date.now();
 
   constructor(
     iceServers: IceServer[],
@@ -47,6 +53,7 @@ export class PeerSession {
 
     this.connection.onicecandidate = (event) => {
       if (event.candidate) {
+        this.localCandidates += 1;
         this.callbacks.onIceCandidate(event.candidate.toJSON());
       }
     };
@@ -95,6 +102,8 @@ export class PeerSession {
       return;
     }
 
+    this.remoteCandidates += 1;
+
     if (!this.remoteDescriptionSet) {
       this.pendingCandidates.push(candidate);
       return;
@@ -106,6 +115,18 @@ export class PeerSession {
       // A candidate that arrives too late is harmless: ICE keeps trying the
       // others.
     }
+  }
+
+  /** What this connection saw, for the log line that explains a failed call. */
+  diagnostics(): PeerDiagnostics {
+    return {
+      ice: this.connection.iceConnectionState,
+      connection: this.connection.connectionState,
+      localCandidates: this.localCandidates,
+      remoteCandidates: this.remoteCandidates,
+      remoteDescription: this.remoteDescriptionSet,
+      elapsedMs: Date.now() - this.startedAt,
+    };
   }
 
   close(): void {

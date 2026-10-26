@@ -59,7 +59,8 @@ func main() {
 			"environment", config.App.Environment,
 			"allowed_origins", config.App.AllowedOrigins,
 			"skip_lock", config.App.SkipLock.String(),
-			"turn_configured", config.App.ICE.TURNURL != "",
+			"turn_configured", len(config.App.ICE.TURNURLs) > 0,
+			"turn_urls", len(config.App.ICE.TURNURLs),
 		)
 
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

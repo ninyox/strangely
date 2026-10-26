@@ -51,7 +51,8 @@ func (s *Store) Cleanup() CleanupStats {
 		stats.SessionsExpired++
 	}
 
-	// 2. Waiting sessions that went away or waited too long.
+	// 2. Waiting sessions that went away, waited too long, or have no socket
+	// left to be matched over.
 	kept := s.queue[:0]
 	for _, id := range s.queue {
 		queuedAt, waiting := s.queuedAt[id]
@@ -59,9 +60,18 @@ func (s *Store) Cleanup() CleanupStats {
 			continue
 		}
 		sess := s.byID[id]
+
+		// A session with no signaling socket cannot answer an offer, so it
+		// must not stay in line: it would be matched and leave the other side
+		// with a partner that is not there. It gets the same grace a live
+		// match gets, so a reconnect is not punished.
+		unreachable := sess != nil && !sess.Connected &&
+			s.idleForLocked(sess, now) > s.opts.MatchIdleTTL
+
 		stale := sess == nil ||
 			now.Sub(queuedAt) > s.opts.QueueTTL ||
-			s.activeMatchLocked(sess) != nil
+			s.activeMatchLocked(sess) != nil ||
+			unreachable
 		if stale {
 			delete(s.queuedAt, id)
 			s.counters.StaleQueueDropped++

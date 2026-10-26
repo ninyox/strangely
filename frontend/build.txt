@@ -1,1 +1,3 @@
  rsync -avz --delete build/client/ glo@153.75.251.218:/var/www/strg/
+ 
+ VITE_API_BASE_URL=https://serve.subll.org bun run build 

@@ -113,6 +113,16 @@ func (h *Hub) Send(sessionID string, ev store.Event) {
 	client.enqueue(ev)
 }
 
+// Has reports whether a session currently has a live signaling socket. The
+// relay path uses it to notice that a message would arrive nowhere, instead of
+// dropping it in silence.
+func (h *Hub) Has(sessionID string) bool {
+	h.mu.RLock()
+	_, ok := h.clients[sessionID]
+	h.mu.RUnlock()
+	return ok
+}
+
 // register adds a client, replacing (and closing) any socket the same session
 // already had. One session, one live socket keeps delivery unambiguous.
 func (h *Hub) register(client *wsClient) {
@@ -150,7 +160,12 @@ func (h *Hub) unregister(client *wsClient) {
 	// comes back within MATCH_IDLE_TTL.
 	if view, err := h.st.Status(client.sessionID); err == nil && view.MatchID != "" {
 		h.st.NotifyPeerUnreachable(client.sessionID, view.MatchID)
+		h.logger.Info("signaling disconnected during a call",
+			"session", client.sessionID, "match", view.MatchID, "state", string(view.State))
+		return
 	}
+
+	h.logger.Info("signaling disconnected", "session", client.sessionID)
 }
 
 // Close shuts every socket down. main.go calls it during graceful shutdown.
@@ -221,9 +236,18 @@ var _ store.Sink = (*Hub)(nil)
 // and only then is the socket upgraded. Both checks happen before any traffic
 // is accepted, and neither can be satisfied by a header a hostile page can
 // forge on behalf of a visitor.
+//
+// Every refusal is logged with the reason. A refused handshake is the one
+// failure that is invisible from the other side of a call — the browser that is
+// left waiting simply sees a partner that never answers — so the log is where
+// it has to be diagnosable.
 func (h *Hub) ServeWS(c *gin.Context) {
-	if origin := c.GetHeader("Origin"); origin != "" {
+	origin := c.GetHeader("Origin")
+
+	if origin != "" {
 		if _, ok := middleware.CORSHeaders(config.App.AllowedOrigins, origin); !ok {
+			h.logger.Warn("signaling refused: origin not allowed",
+				"origin", origin, "allowed_origins", config.App.AllowedOrigins)
 			utils.ErrorResponseCode(c, http.StatusForbidden, "origin_not_allowed",
 				"This origin may not open a signaling connection.", nil)
 			return
@@ -235,6 +259,7 @@ func (h *Hub) ServeWS(c *gin.Context) {
 
 	token, err := c.Cookie(config.App.CookieName)
 	if err != nil || token == "" {
+		h.logger.Info("signaling refused: no session cookie", "origin", origin)
 		utils.ErrorResponseCode(c, http.StatusUnauthorized, "no_session",
 			"No session yet. Reload the page to start one.", nil)
 		return
@@ -242,6 +267,7 @@ func (h *Hub) ServeWS(c *gin.Context) {
 
 	view, ok := h.st.Authenticate(token)
 	if !ok {
+		h.logger.Info("signaling refused: session expired", "origin", origin)
 		utils.ErrorResponseCode(c, http.StatusUnauthorized, "session_expired",
 			"Your session expired. Reload the page.", nil)
 		return
@@ -249,8 +275,9 @@ func (h *Hub) ServeWS(c *gin.Context) {
 
 	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		// Upgrade has already written a response.
-		h.logger.Debug("signaling upgrade failed", "error", err, "session", view.ID)
+		// Upgrade has already written a response. A proxy that does not
+		// forward Upgrade/Connection lands here.
+		h.logger.Warn("signaling upgrade failed", "error", err, "session", view.ID, "origin", origin)
 		return
 	}
 
@@ -263,6 +290,7 @@ func (h *Hub) ServeWS(c *gin.Context) {
 	}
 
 	h.register(client)
+	h.logger.Info("signaling connected", "session", view.ID, "origin", origin)
 	defer client.close()
 
 	go client.writeLoop()
@@ -294,6 +322,11 @@ func (c *wsClient) readLoop() {
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
+			// Why a socket ended is the single most useful line when two
+			// browsers cannot reach each other: 1006 with no close frame is
+			// what a network that drops idle connections looks like, and a
+			// read timeout is what a backgrounded phone looks like.
+			c.hub.logger.Info("signaling read ended", "session", c.sessionID, "error", err)
 			return
 		}
 
@@ -331,16 +364,115 @@ func (c *wsClient) handle(msg clientMessage) {
 		c.relay(msg)
 
 	case msgBye:
-		// An explicit goodbye, sent when the tab is closed or the page is
-		// hidden, so the partner sees "Your partner left" straight away
-		// instead of waiting for the janitor.
-		if _, err := c.hub.st.Leave(c.sessionID, msg.MatchID, models.ReasonLeft); err != nil {
+		// An explicit goodbye, sent when the tab is closed, the page is
+		// hidden, or a peer connection has failed, so the partner sees why the
+		// call ended straight away instead of waiting for the janitor.
+		details := parseBye(msg.Payload)
+
+		if d := details.Diagnostics; d != nil {
+			// The one place a browser can say why its media never arrived.
+			// Logging it is what makes a blank video debuggable from the
+			// server log alone: no candidates on the other side means the
+			// messages did not cross, candidates on both sides that never
+			// paired means NAT.
+			c.hub.logger.Warn("browser gave up on its peer connection",
+				"session", c.sessionID,
+				"match", msg.MatchID,
+				"ice", iceState(d.ICE),
+				"connection", connectionState(d.Connection),
+				"local_candidates", clampCount(d.LocalCandidates),
+				"remote_candidates", clampCount(d.RemoteCandidates),
+				"remote_description", d.RemoteDescription,
+				"elapsed_ms", clampElapsedMs(d.ElapsedMs),
+			)
+		}
+
+		if _, err := c.hub.st.Leave(c.sessionID, msg.MatchID, details.reason()); err != nil {
 			c.enqueue(errorEvent("not_in_match", "That call is no longer active."))
 		}
 
 	default:
 		c.enqueue(errorEvent("unknown_type", "Unsupported signaling message type."))
 	}
+}
+
+// byeDetails is the optional body of a goodbye: why this side is leaving, and —
+// when a call ended because its media never arrived — what its peer connection
+// looked like. The reason decides behaviour; the diagnostics are only logged,
+// and they are clamped to values this server understands, so a client cannot
+// write whatever it likes into the log.
+type byeDetails struct {
+	Reason      string `json:"reason"`
+	Diagnostics *struct {
+		ICE               string `json:"ice"`
+		Connection        string `json:"connection"`
+		LocalCandidates   int    `json:"localCandidates"`
+		RemoteCandidates  int    `json:"remoteCandidates"`
+		RemoteDescription bool   `json:"remoteDescription"`
+		ElapsedMs         int64  `json:"elapsedMs"`
+	} `json:"diagnostics"`
+}
+
+// parseBye reads the body of a goodbye. A body that cannot be read is treated
+// as a plain "left": a goodbye must never fail because of its extras.
+func parseBye(payload json.RawMessage) byeDetails {
+	var details byeDetails
+	if len(payload) == 0 {
+		return details
+	}
+	if err := json.Unmarshal(payload, &details); err != nil {
+		return byeDetails{}
+	}
+	return details
+}
+
+// reason is the reason a browser is allowed to claim. A client may say that its
+// own connection dropped, never invent what the partner is told.
+func (b byeDetails) reason() string {
+	if b.Reason == models.ReasonDisconnected {
+		return models.ReasonDisconnected
+	}
+	return models.ReasonLeft
+}
+
+// iceState and connectionState keep the log to the states the browser spec
+// defines, so a hostile client cannot inject text into the server log.
+func iceState(value string) string {
+	switch value {
+	case "new", "checking", "connected", "completed", "disconnected", "failed", "closed":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func connectionState(value string) string {
+	switch value {
+	case "new", "connecting", "connected", "disconnected", "failed", "closed":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func clampCount(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 10_000 {
+		return 10_000
+	}
+	return value
+}
+
+func clampElapsedMs(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	if max := int64((24 * time.Hour).Milliseconds()); value > max {
+		return max
+	}
+	return value
 }
 
 // relay forwards an offer, answer or ICE candidate to the partner.
@@ -361,7 +493,24 @@ func (c *wsClient) relay(msg clientMessage) {
 		return
 	}
 
+	// A partner with no live socket would receive nothing, and saying nothing
+	// would leave this side staring at a frozen picture until its own ICE
+	// gives up. Telling it now is the difference between "the call could not
+	// start" and a silent minute of waiting for somebody who is not there.
+	if !c.hub.Has(target) {
+		c.hub.logger.Warn("signaling message dropped: partner has no socket",
+			"from", c.sessionID, "to", target, "match", msg.MatchID, "type", msg.Type)
+		c.enqueue(errorEvent("partner_offline", "Your partner's signaling connection dropped."))
+		return
+	}
+
 	c.hub.Send(target, relayEvent(msg.Type, msg.MatchID, msg.Payload))
+
+	// At debug level this traces a whole call: hello, matched, offer, answer,
+	// and every ICE candidate, which is what a call that never connects needs.
+	c.hub.logger.Debug("signaling relayed",
+		"from", c.sessionID, "to", target, "match", msg.MatchID,
+		"type", msg.Type, "bytes", len(msg.Payload))
 }
 
 // writeLoop owns every write on the socket, which gorilla/websocket requires.

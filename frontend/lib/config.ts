@@ -5,8 +5,7 @@
  * defaults to the local Go server so `bun run dev` works with no configuration
  * at all.
  */
-// const DEFAULT_API_BASE_URL = "http://localhost:8080";
-const DEFAULT_API_BASE_URL= "https://serve.subll.org"
+const DEV_API_BASE_URL = "http://localhost:8080";
 
 function readEnv(key: string): string | undefined {
   const env = import.meta.env as Record<string, unknown> | undefined;
@@ -14,7 +13,24 @@ function readEnv(key: string): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
 }
 
-export const API_BASE_URL = (readEnv("VITE_API_BASE_URL") ?? DEFAULT_API_BASE_URL).replace(/\/+$/, "");
+/**
+ * A production bundle that points at localhost cannot work for a visitor, so a
+ * build made without VITE_API_BASE_URL falls back to the origin the app was
+ * served from — where the API is normally proxied — instead of at a
+ * development address that only exists on the machine that built it.
+ */
+function fallbackApiBaseUrl(): string {
+  if (import.meta.env.PROD) {
+    console.warn(
+      "VITE_API_BASE_URL is not set: using the origin this build is served from. " +
+        "Set VITE_API_BASE_URL and rebuild to point at a different API host.",
+    );
+    return window.location.origin;
+  }
+  return DEV_API_BASE_URL;
+}
+
+export const API_BASE_URL = (readEnv("VITE_API_BASE_URL") ?? fallbackApiBaseUrl()).replace(/\/+$/, "");
 
 /** The API root, e.g. http://localhost:8080/api */
 export const API_ROOT = `${API_BASE_URL}/api`;

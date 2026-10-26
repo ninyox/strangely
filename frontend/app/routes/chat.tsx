@@ -16,8 +16,10 @@ import {
 } from "../components/state-panels";
 import { useCall } from "../../lib/call";
 import { ROUTES } from "../../lib/config";
+import { useFullscreen } from "../../lib/fullscreen";
 import { useMedia } from "../../lib/media";
 import { useSession } from "../../lib/session";
+import { cn } from "../../lib/utils";
 
 /**
  * The call screen.
@@ -36,11 +38,26 @@ export default function ChatRoute() {
   // The flow is started exactly once per visit to this route.
   const started = useRef(false);
 
+  // Full screen is a property of the call, not of the route: the frame holds the
+  // picture and the controls together so neither can be lost.
+  const callFrameRef = useRef<HTMLDivElement | null>(null);
+  const { expanded, toggle: toggleFullscreen, collapse: collapseFullscreen } =
+    useFullscreen(callFrameRef);
+
+  const inCall = call.phase === "connecting" || call.phase === "connected";
+
+  // A call that ends gives the screen back, in either mode: the frame is gone,
+  // so a filled page would otherwise stay locked behind it.
+  useEffect(() => {
+    if (!inCall) {
+      collapseFullscreen();
+    }
+  }, [inCall, collapseFullscreen]);
+
   const [reportOpen, setReportOpen] = useState(false);
   const [safetyOpen, setSafetyOpen] = useState(false);
 
   const username = session.readyUsername();
-  const inCall = call.phase === "connecting" || call.phase === "connected";
 
   useEffect(() => {
     // Wait for the anonymous session before deciding anything: on a hard reload
@@ -88,7 +105,15 @@ export default function ChatRoute() {
           ) : null}
 
           {inCall ? (
-            <>
+            <div
+              ref={callFrameRef}
+              className={cn(
+                "flex flex-col gap-4",
+                // The full screen target is the whole call, controls included:
+                // filling the screen must never take Stop away.
+                expanded && "fixed inset-0 z-40 gap-0 bg-stage px-0",
+              )}
+            >
               <CallStage
                 remoteStream={call.remoteStream}
                 localStream={media.stream}
@@ -97,17 +122,20 @@ export default function ChatRoute() {
                 connectionState={call.connectionState}
                 signalingConnected={call.signalingConnected}
                 peerUnreachable={call.peerUnreachable}
+                expanded={expanded}
+                onToggleFullscreen={toggleFullscreen}
               />
 
               <CallControls
                 remainingMs={call.remainingMs}
                 skipLockMs={call.skipLockMs}
                 busy={call.busy}
+                expanded={expanded}
                 onSkip={() => void call.skip()}
                 onStop={() => void call.stop()}
                 onReport={() => setReportOpen(true)}
               />
-            </>
+            </div>
           ) : null}
 
           {call.phase === "ended" ? (

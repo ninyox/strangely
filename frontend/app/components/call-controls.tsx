@@ -21,6 +21,7 @@ export function CallControls({
   onStop,
   onReport,
   busy = false,
+  expanded = false,
 }: {
   remainingMs: number;
   skipLockMs: number;
@@ -28,6 +29,8 @@ export function CallControls({
   onStop: () => void;
   onReport: () => void;
   busy?: boolean;
+  /** Inside a full screen call the bar is a flex row, not a sticky footer. */
+  expanded?: boolean;
 }) {
   const media = useMedia();
   const skipLocked = isSkipLocked(remainingMs);
@@ -35,7 +38,14 @@ export function CallControls({
   const seconds = Math.max(1, Math.ceil(remainingMs / 1000));
 
   return (
-    <div className="sticky bottom-0 z-30 -mx-4 mt-1 border-t border-stage-line bg-stage/95 px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 backdrop-blur-md sm:mx-0 sm:rounded-stage sm:border sm:px-4 sm:pb-4">
+    <div
+      className={cn(
+        "sticky bottom-0 z-30 -mx-4 mt-1 border-t border-stage-line bg-stage/95 px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 backdrop-blur-md sm:mx-0 sm:rounded-stage sm:border sm:px-4 sm:pb-4",
+        // Expanded: the call already owns the viewport, so the bar is simply
+        // the last row of it — no bleed past the screen edge, no rounding.
+        expanded && "mx-0 mt-0 rounded-none border-x-0 border-b-0",
+      )}
+    >
       <div className="flex items-center justify-center gap-1.5 sm:gap-2.5">
         <Button
           type="button"

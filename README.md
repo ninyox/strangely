@@ -122,7 +122,9 @@ Fluid `clamp()` type means no breakpoint juggling; the layout grid moves from on
 column to a deliberate asymmetry at `lg`. The call screen becomes a dark room
 with a **sticky bottom control bar** on a phone — thumb-reachable, 44px targets,
 `env(safe-area-inset-bottom)` padding — and dialogs become bottom sheets below
-`sm`. Tap targets, not just text, scale.
+`sm`. Tap targets, not just text, scale. The call itself can be expanded to fill
+the screen, by the control on the picture; the control bar stays on screen in
+that mode, so Stop is never the thing that gets hidden.
 
 
 
@@ -190,6 +192,21 @@ Signaling messages (both directions) are
 and the server pushes `hello`, `matched`, `partner_ready`, `partner_left`,
 `peer_unreachable`, `pong`, and `error`.
 
+Three details of that contract matter in a real deployment:
+
+* **A `bye` may carry `{ "reason": "disconnected" }`.** The server accepts that
+  one reason (anything else is treated as `left`), so a browser that gives up on
+  a peer connection that never came up tells the partner *why* instead of
+  leaving it in a call that cannot work.
+* **`error` with `code: "partner_offline"`** means a signaling message was not
+  delivered because the partner has no live socket. The sending side is told
+  immediately rather than waiting for its own ICE to time out.
+* **The greeting is authoritative.** `hello.state` reports the session's real
+  state, so a client that reconnects either resumes the call it is in, ends a
+  call the server has already closed, or says goodbye to a call it never joined.
+  Matchmaking also waits for the signaling socket to open before joining the
+  queue: a session the server cannot reach must never be paired with somebody.
+
 ## 6. The five second Skip rule
 
 `matchedAt` is recorded on the server when two sessions are paired. A Skip
@@ -252,7 +269,8 @@ someone new**.
 
 ## 8. Configuration
 
-Backend (`backend/.env.example`, loaded from `.env` by `config.LoadEnv`):
+Backend (`backend/.env.example`, loaded from `.env` by `config.LoadEnv`; a
+`.env.local` beside it is read first and wins, for a development machine only):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -265,9 +283,10 @@ Backend (`backend/.env.example`, loaded from `.env` by `config.LoadEnv`):
 | `MATCH_IDLE_TTL` | `20s` | Grace period before a silent peer's call is ended |
 | `MAX_MATCH_DURATION` | `1h` | Hard cap on one call |
 | `SKIP_LOCK_SECONDS` | `5` | The server-enforced Skip window |
-| `STUN_URLS` | `stun:stun.l.google.com:19302` | ICE STUN servers |
-| `TURN_URL`, `TURN_SHARED_SECRET`, `TURN_CREDENTIAL_TTL` | — / — / `1h` | TURN with short-lived credentials |
-| `TURN_USERNAME`, `TURN_CREDENTIAL` | — | Static TURN credentials (fallback only) |
+| `STUN_URLS` | `stun:stun.l.google.com:19302` | ICE STUN servers (comma separated) |
+| `TURN_URLS` | — | TURN URLs (comma separated; UDP, TCP and TLS entries share one credential). `TURN_URL` is still read as the single-URL form |
+| `TURN_SHARED_SECRET`, `TURN_CREDENTIAL_TTL` | — / `1h` | TURN with short-lived credentials minted per request |
+| `TURN_USERNAME`, `TURN_CREDENTIAL` | — | Static TURN credentials for a hosted relay (handed to every visitor) |
 | `RATE_LIMIT_SESSION_PER_MINUTE` etc. | `20` / `60` / `60` / `5` | Session, join, signaling, report budgets |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `TRUSTED_PROXIES` | empty | Proxy addresses; empty means use the socket peer address |
@@ -279,7 +298,7 @@ Frontend (`frontend/.env.example`):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `VITE_API_BASE_URL` | `http://localhost:8080` | The single API base URL; the WebSocket URL and the CSP `connect-src` are derived from it |
+| `VITE_API_BASE_URL` | `http://localhost:8080` (dev) | The single API base URL; the WebSocket URL and the CSP `connect-src` are derived from it. **Baked into the bundle at build time** — set it for the production build, or the build falls back to the origin it is served from |
 | `PORT` | `3000` | Port for the production static server |
 
 ## 9. Tests
@@ -353,8 +372,42 @@ Both projects ship a `Dockerfile`. The frontend image takes
 `--build-arg VITE_API_BASE_URL=…` because that value is baked into the bundle;
 `server.mjs` reads the same variable at runtime for its CSP `connect-src`.
 
-**Reverse proxy** — serve the static build and proxy `/api` (including the
-WebSocket upgrade) to Go:
+**Reverse proxy.** Caddy is the simplest option: `reverse_proxy` passes
+WebSocket upgrades through untouched, so `/api/signaling` needs no special
+handling at all.
+
+```caddyfile
+strangerly.example {
+	encode zstd gzip
+
+	# The API, /api/signaling included.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080 {
+			# Overwrite instead of trusting what arrived: by default Caddy
+			# passes an incoming X-Forwarded-For through, which would let a
+			# client choose the address the rate limit is keyed on.
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	# The SPA: deep links fall back to the shell, so a hard reload of /chat
+	# works. This serves build/client from disk, which is what the rsync
+	# deploy writes.
+	handle {
+		root * /var/www/strangerly
+		try_files {path} /index.html
+		file_server
+	}
+}
+```
+
+Serving the files from disk costs the Content-Security-Policy: the nonce-based
+policy lives in `frontend/server.mjs`, and Caddy cannot apply it to files it
+serves itself. To keep it, run the static server and point Caddy at that instead
+— `VITE_API_BASE_URL=… PORT=3000 node server.mjs`, then
+`reverse_proxy 127.0.0.1:3000` for the catch-all `handle`.
+
+*nginx*, if you prefer it, needs the upgrade plumbing spelled out:
 
 ```nginx
 server {
@@ -380,16 +433,119 @@ server {
 }
 ```
 
-If the proxy forwards a client address, set `TRUSTED_PROXIES` to the proxy
-address so gin reads `X-Forwarded-For` only from a source it can trust. Also set
-`ALLOWED_ORIGINS` to the public origin and `COOKIE_SECURE=true`.
+**Client addresses.** With a proxy in front, set `TRUSTED_PROXIES` to the address
+the proxy connects *from* — `127.0.0.1` when it proxies to a loopback port, a
+Docker bridge address when it runs in a container. Get this wrong and every
+visitor looks like the proxy, which turns the per-address session limit into one
+bucket shared by the whole world. The backend's own access log tells you what it
+resolved: `journalctl -u strgback | grep /api/session` must print the visitor's
+address, not the proxy's. Because both Caddy and nginx pass an incoming
+`X-Forwarded-For` through by default, overwrite it when the proxy is the edge
+(`header_up X-Forwarded-For {remote_host}` in Caddy,
+`proxy_set_header X-Forwarded-For $remote_addr` in nginx) — otherwise a client
+can forge the address the rate limit is keyed on.
+
+Also set `ALLOWED_ORIGINS` to the public origin and `COOKIE_SECURE=true`.
+
+**When two phones never connect, check these in order.** They can look alike
+from the outside — a call that never starts, or one side told the other
+"disconnected" although it never connected — so it is worth knowing which link
+is broken:
+
+1. **The signaling socket.** The backend log says which of the three it is, in
+   one line each: `signaling refused: origin not allowed` (the `Origin` the
+   browser sent is not in `ALLOWED_ORIGINS`), `signaling refused: no session
+   cookie` (the cookie was not sent — app and API are on different *sites*), or
+   `signaling upgrade failed` (an nginx proxy that is not forwarding
+   `Upgrade`/`Connection`; Caddy handles upgrades on its own). `signaling
+   connected` means the socket is fine, and
+   `signaling read ended` / `signaling disconnected …` says when and why it
+   stopped. In the browser, the WebSocket must reach `101 Switching Protocols`;
+   the same checks by hand:
+   `curl -i -H 'Origin: https://your.origin' -H 'Connection: Upgrade' -H 'Upgrade: websocket' https://your.api/api/signaling`.
+2. **The session cookie.** The handshake also needs `strg_session`. Cross-*site*
+   deployments (app and API on different registrable domains) do not send a
+   `SameSite=Lax` cookie, so keep both on the same site (subdomains are fine).
+   `COOKIE_SECURE=true` needs HTTPS end to end; an empty `COOKIE_DOMAIN` is the
+   right choice and makes the cookie host-only.
+3. **The media path**, when both phones reach the call screen, show their own
+   camera, and stay on "Connecting" with a blank partner tile. That is the peer
+   connection, not signaling. A browser that gives up now reports what it saw,
+   and the backend logs it:
+   `browser gave up on its peer connection … ice=failed local_candidates=8
+   remote_candidates=0 remote_description=true`. Read it as:
+   `remote_description=false` → the offer or answer never crossed (a signaling
+   problem after all); `remote_candidates=0` → the partner's candidates never
+   crossed (relay or firewall); candidates on both sides with `ice=failed` → the
+   candidates crossed and never paired, which is NAT. On Android,
+   `chrome://webrtc-internals` shows the same thing live, including the
+   candidate pairs. `LOG_LEVEL=debug` also traces every relayed offer, answer and
+   candidate, so a whole call can be followed in the log.
+4. **TURN**, for the NAT case in 3: two mobile networks usually cannot connect
+   with STUN alone, while two phones on the same Wi-Fi normally can — so test
+   both phones on one Wi-Fi first to tell the two apart. Set `TURN_URLS` and
+   either a shared secret or a static credential pair, and every visitor gets
+   the relay in `GET /api/config`.
+
+**Adding TURN (coturn).** TURN is the only fix for the case in 3 where the
+candidates crossed and never paired, and it is what makes mobile-to-mobile calls
+work. The backend already mints time-limited credentials from a shared secret
+(`handlers/config.go`), so coturn only needs the same secret:
+
+```ini
+# /etc/turnserver.conf
+listening-port=3478
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_A_LONG_RANDOM_SECRET
+realm=serve.subll.org
+min-port=49160
+max-port=49200
+no-multicast-peers
+no-cli
+```
+
+```bash
+# backend/.env
+TURN_URLS=turn:serve.subll.org:3478?transport=udp,turn:serve.subll.org:3478?transport=tcp
+TURN_SHARED_SECRET=REPLACE_WITH_A_LONG_RANDOM_SECRET   # identical to coturn
+TURN_CREDENTIAL_TTL=1h
+```
+
+Every URL in `TURN_URLS` is handed to the browser as one entry with the same
+credential, which is what makes a UDP entry, a TCP entry and a TLS-on-443 entry
+work as fallbacks for each other.
+
+Allow **3478/udp**, **3478/tcp** and the relay range (**49160-49200/udp**) in the
+host firewall *and* in the provider's firewall — a blocked relay range is the
+usual reason "TURN is configured" and calls still fail. For networks that block
+UDP entirely, add a TLS listener (`tls-listening-port=5349` plus `cert`/`pkey`)
+and list that URL as well: `TURN_URLS` takes all of them at once.
+
+Verify: the startup log says `turn_configured=true` (with `turn_urls=N`), and
+`curl -s https://your.api/api/config` lists a `turn:` entry with a `username`
+and a `credential` that changes on every request. Then a call whose log line
+shows `ice=connected` (or simply a picture) is one that used the relay.
+
+`Your partner left` ("They closed the page") only ever comes from an explicit
+goodbye, so it always means the other page went away: the tab was closed or
+hidden, or the page was reloaded. On a phone that is usually the screen locking,
+switching apps, or the OS discarding a backgrounded tab — worth knowing before
+reading it as a network fault.
+
+The app itself is now defensive about all three: it opens the signaling socket
+*before* joining the queue, tells the partner when it gives up on a peer
+connection, and reports `partner_offline` instead of silently dropping a
+signaling message that could not be delivered.
 
 **Scaling path (not required for the prototype)**
 
 * **TURN**: a STUN-only setup fails on symmetric NATs and some corporate
-  firewalls. Add a TURN server and configure `TURN_URL` + `TURN_SHARED_SECRET`;
-  the backend then mints short-lived credentials per request, so no static
-  credential is ever shipped to a browser.
+  firewalls. Add a TURN server and configure `TURN_URLS` + `TURN_SHARED_SECRET`
+  (or `TURN_URLS` + `TURN_USERNAME`/`TURN_CREDENTIAL` for a hosted relay); the
+  backend then hands every visitor the relay, minting short-lived credentials
+  per request in the shared-secret form, so no static credential is ever shipped
+  to a browser.
 * **Multiple replicas**: matchmaking state is per process, so two replicas
   cannot see each other's queues. Moving the `store.Store` methods onto Redis
   (queue, session records, match records, and pub/sub for signaling) is the
@@ -448,6 +604,20 @@ What was actually run, and what could not be:
   page reload, which made it hang up on its own partner. Both are fixed.
 * ✅ The production static server serves the SPA, applies the CSP nonce to all
   three inline shell scripts, and answers `200` for deep links such as `/chat`.
+* ✅ **Full screen driven end to end** in headless Chrome over the DevTools
+  protocol: the browser is put into a real call (a scripted partner joins the
+  queue), the control on the picture is pressed, and 16 assertions check that the
+  call fills the viewport, the picture switches from `object-cover` to
+  `object-contain`, **Stop stays inside the viewport** at 1280×757 and at
+  390×844, nothing overflows sideways on a phone, leaving full screen restores
+  the layout and the page scroll, and a call that ends while expanded gives the
+  screen back. Screenshots at both sizes were inspected by eye.
+  ⚠️ Native full screen itself could not be exercised: headless Chrome has no
+  window manager, so `requestFullscreen()` never produces a fullscreen element
+  and the **filled-page fallback** is what those runs verified — which is also
+  the path an iPhone takes, since Safari there refuses the API for anything that
+  is not a video element. The native path is a five-line branch of the same
+  toggle; check it once by hand on a desktop browser.
 * ❌ **Live peer-to-peer video between two browsers was not verified.** This
   environment has no camera and no display: the browser checks above used a
   synthetic device and confirmed that `getUserMedia` runs and that a video
@@ -469,11 +639,15 @@ What was actually run, and what could not be:
 5. Try **Skip** immediately: it should refuse, showing `Skip in 5…4…3…2…1`.
 6. Confirm **Stop**, **Report**, mute, and camera-off all work during those five
    seconds.
-7. After five seconds, Skip from one side and confirm the other side shows
+7. Press the full screen control on the picture: the call should fill the
+   screen with the control bar still there, the picture letterboxed rather than
+   cropped, and the control itself should turn into "leave full screen".
+   Press it again (or `Esc`) and the page should come back exactly as it was.
+8. After five seconds, Skip from one side and confirm the other side shows
    "Your partner left" with **Find someone new**.
-8. Press **Find someone new** in both and confirm a fresh match.
-9. Repeat with one tab closed mid-call, and with one side denying camera access
-   (expect a clear permission message and no queue entry).
+9. Press **Find someone new** in both and confirm a fresh match.
+10. Repeat with one tab closed mid-call, and with one side denying camera access
+    (expect a clear permission message and no queue entry).
 
 ## 13. Changed files and run commands
 
@@ -512,7 +686,7 @@ motion), `app/root.tsx`, `app/routes.ts`,
 `video-tile`, `notice`, `spinner` — spinner, signal rings and the live dot, and
 `ui/{button,input,surface,dialog}`),
 `lib/` (`config`, `api`, `types`, `username`, `skip`, `session`, `media`,
-`signaling`, `webrtc`, `call`, `utils`, plus `*.test.ts`),
+`signaling`, `webrtc`, `fullscreen`, `call`, `utils`, plus `*.test.ts`),
 `public/favicon.svg`, `public/fonts/{InterVar,Fraunces}-{latin,latin-ext}.woff2`,
 `server.mjs` (rewritten), `Dockerfile`, `README.md`, `.env.example`.
 Frontend, removed from the copy: the Subll landing/dashboard routes and

@@ -44,6 +44,46 @@ func TestPartnerDisconnectEndsTheMatchOnCleanup(t *testing.T) {
 	_ = matchID
 }
 
+func TestQueueDropsWaitingSessionsThatLostTheirSocket(t *testing.T) {
+	st, _, clock := newTestStore(t)
+
+	// A session queues with a live signaling socket, then that socket goes
+	// away — the tab was closed, or the phone lost its network.
+	waiting := newSession(t, st, "Waiting")
+	st.MarkConnected(waiting, true)
+	if _, err := st.Join(waiting); err != nil {
+		t.Fatalf("join failed: %v", err)
+	}
+	st.MarkConnected(waiting, false)
+
+	clock.Advance(21 * time.Second)
+
+	stats := st.Cleanup()
+	if stats.QueueDropped != 1 {
+		t.Fatalf("cleanup dropped %d queue entries, want 1", stats.QueueDropped)
+	}
+
+	// A session with no socket cannot answer an offer, so the next arrival
+	// must not be paired with it: that arrival would sit in front of a call
+	// that can never be answered, and be told the "partner" disconnected.
+	arrival := newSession(t, st, "Arrival")
+	res, err := st.Join(arrival)
+	if err != nil {
+		t.Fatalf("arrival join failed: %v", err)
+	}
+	if res.MatchID != "" || res.State != models.StateQueued {
+		t.Fatalf("arrival = %+v, want to be queued rather than matched with an unreachable session", res)
+	}
+
+	view, err := st.Status(waiting)
+	if err != nil {
+		t.Fatalf("status failed: %v", err)
+	}
+	if view.State != models.StateIdle || view.MatchID != "" {
+		t.Errorf("the waiting session = %+v, want it back to idle", view)
+	}
+}
+
 func TestMaxMatchDurationEndsTheCall(t *testing.T) {
 	st, sink, clock := newTestStore(t)
 

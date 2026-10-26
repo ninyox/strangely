@@ -59,6 +59,13 @@ const CallContext = createContext<CallContextValue | null>(null);
 /** How long a dropped peer connection is given before the call is closed. */
 const DISCONNECT_GRACE_MS = 12_000;
 
+/**
+ * How long matching waits for the signaling socket to open. Joining the queue
+ * without a live socket is what produces a partner who can never answer, so the
+ * wait is bounded but real.
+ */
+const SIGNALING_OPEN_TIMEOUT_MS = 6000;
+
 const FALLBACK_ICE_SERVERS: IceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
 
 export function CallProvider({ children }: { children: React.ReactNode }) {
@@ -93,6 +100,15 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   // from a first connection that happens to arrive after our own join.
   const hasJoinedThisPageRef = useRef(false);
 
+  // The match this page has already given up on. A greeting that still reports
+  // it (the server has not been told yet, or the goodbye never left) must not
+  // restart a call that was ended on purpose.
+  const abandonedMatchRef = useRef<string | null>(null);
+
+  // True while a join request is in flight. The greeting arrives first on a
+  // reload, and the join response is what decides whether that call survives.
+  const joiningRef = useRef(false);
+
   // Values the socket handlers need without re-creating the socket on every
   // render. Refs are kept in step by the effect below.
   const live = useRef<{ stream: MediaStream | null }>({ stream: null });
@@ -118,6 +134,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   const endCall = useCallback(
     (reason: EndReason | null, message: string | null = null) => {
       teardownPeer();
+      abandonedMatchRef.current = matchRef.current;
       matchRef.current = null;
       setMatchId(null);
       setRemainingMs(0);
@@ -129,6 +146,24 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     },
     [teardownPeer],
   );
+
+  /**
+   * Tell the server this side is leaving, with an honest reason. The partner is
+   * told immediately instead of waiting for the janitor's timeout, and the
+   * match stops existing for both sides.
+   *
+   * A call that ended because the media never arrived also reports what the
+   * peer connection looked like, so the backend log can say whether the
+   * candidates crossed at all.
+   */
+  const sayGoodbye = useCallback((matchId: string | null, reason: "left" | "disconnected") => {
+    if (!matchId) {
+      return;
+    }
+
+    const diagnostics = reason === "disconnected" ? peerRef.current?.diagnostics() : undefined;
+    signalingRef.current?.send("bye", matchId, { reason, diagnostics });
+  }, []);
 
   /** Build the peer connection for a fresh match and start negotiating. */
   const startPeer = useCallback(
@@ -162,6 +197,9 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
             if (disconnectTimerRef.current === null) {
               disconnectTimerRef.current = setTimeout(() => {
                 disconnectTimerRef.current = null;
+                // Say why, so the partner is not left waiting on a call that
+                // this side has already given up on.
+                sayGoodbye(matchRef.current, "disconnected");
                 endCall("disconnected", "The video connection dropped. Find someone new.");
               }, DISCONNECT_GRACE_MS);
             }
@@ -169,6 +207,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (state === "failed") {
+            sayGoodbye(matchRef.current, "disconnected");
             endCall("disconnected", "The connection could not be established. Try someone new.");
           }
         },
@@ -187,7 +226,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         }
       }
     },
-    [endCall],
+    [endCall, sayGoodbye],
   );
 
   /** The username to use for a match request: the last one the visitor chose. */
@@ -206,16 +245,82 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           }
 
           const resumed = data?.state;
-          if (
-            resumed?.matchId &&
-            (resumed.state === "matched" || resumed.state === "connecting") &&
-            !hasJoinedThisPageRef.current
-          ) {
+          const liveMatchId =
+            resumed?.matchId && (resumed.state === "matched" || resumed.state === "connecting")
+              ? resumed.matchId
+              : null;
+
+          if (liveMatchId && !hasJoinedThisPageRef.current) {
             // A reload landed on a call this page never joined. A peer
             // connection cannot be restored from a cold start, so say goodbye
             // rather than leaving the other side looking at a frozen picture.
-            signalingRef.current?.send("bye", resumed.matchId);
+            sayGoodbye(liveMatchId, "left");
             endCall("left", "That call ended when the page reloaded.");
+            break;
+          }
+
+          // The server says the call this page believes in is already over —
+          // it ended while the socket was down, so the push that would have
+          // said so was lost with it.
+          if (
+            resumed?.state === "ended" &&
+            matchRef.current &&
+            (!resumed.lastEndedMatchId || resumed.lastEndedMatchId === matchRef.current)
+          ) {
+            endCall(resumed.lastEndedReason ?? null);
+            break;
+          }
+
+          // A call this page did join, but that it never heard about: the
+          // socket was still opening (or reconnecting) when the match was made.
+          // The greeting carries the same state the "matched" push would have,
+          // which is what lets the call start instead of leaving this side
+          // waiting in the queue while a partner talks to nobody.
+          if (
+            liveMatchId &&
+            matchRef.current === null &&
+            !peerRef.current &&
+            !joiningRef.current
+          ) {
+            if (abandonedMatchRef.current === liveMatchId) {
+              break;
+            }
+
+            const stream = live.current.stream;
+            if (!stream) {
+              sayGoodbye(liveMatchId, "left");
+              endCall(null, "Camera access was lost, so the call could not start.");
+              break;
+            }
+
+            matchRef.current = liveMatchId;
+            reportableMatchRef.current = liveMatchId;
+            setMatchId(liveMatchId);
+            setPartnerUsername(resumed?.partnerUsername ?? null);
+            setInitiator(Boolean(resumed?.initiator));
+            setMatchedAt(resumed?.matchedAt ?? null);
+            setSkipLockMs(resumed?.skipLockMs ?? skipLockMs);
+            setRemainingMs(
+              typeof resumed?.remainingMs === "number"
+                ? resumed.remainingMs
+                : computeRemainingMs(
+                    resumed?.matchedAt,
+                    resumed?.skipLockMs ?? skipLockMs,
+                    Date.now(),
+                    offsetRef.current,
+                  ),
+            );
+            setEndedReason(null);
+            setError(null);
+            setPeerUnreachable(false);
+            setPhase("connecting");
+
+            void startPeer(
+              liveMatchId,
+              Boolean(resumed?.initiator),
+              stream,
+              iceRef.current ?? FALLBACK_ICE_SERVERS,
+            );
           }
           break;
         }
@@ -292,6 +397,16 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           const data = event.data as { code?: string; message?: string } | undefined;
           if (data?.code === "not_in_match") {
             endCall(null, "That call is no longer active.");
+          } else if (data?.code === "partner_offline") {
+            // The server could not deliver a signaling message, because the
+            // partner has no live socket. Waiting for ICE to give up would
+            // look like a frozen screen, so the call is ended with the truth.
+            if (peerRef.current?.connectionState !== "connected") {
+              sayGoodbye(matchRef.current, "disconnected");
+              endCall("disconnected", "Your partner's connection dropped, so the call could not start.");
+            } else {
+              setError("Your partner's connection is unstable. The call may drop.");
+            }
           } else if (data?.code === "rate_limited") {
             setError("Too many signaling messages. The call may take longer to connect.");
           }
@@ -302,7 +417,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           break;
       }
     },
-    [endCall, startPeer],
+    [endCall, sayGoodbye, skipLockMs, startPeer],
   );
 
   // The socket is created once, so its handlers read the latest callback
@@ -375,6 +490,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
       setBusy(true);
       lastUsernameRef.current = username;
       hasJoinedThisPageRef.current = true;
+      joiningRef.current = true;
 
       try {
         const support = webRtcSupport();
@@ -393,7 +509,16 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         live.current.stream = stream;
 
         const iceServers = await ensureIceServers();
-        ensureSignaling();
+
+        // The socket has to be open before this visit enters the queue. A
+        // session the server cannot reach is a session that gets matched with
+        // somebody who then talks to nobody.
+        const signaling = ensureSignaling();
+        if (!(await signaling.waitForOpen(SIGNALING_OPEN_TIMEOUT_MS))) {
+          setError("Could not open the connection to Strangerly. Check your network and try again.");
+          setPhase("idle");
+          return;
+        }
 
         let payload: StatePayload;
         try {
@@ -438,6 +563,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         setError(apiErrorMessage(cause));
         setPhase("idle");
       } finally {
+        joiningRef.current = false;
         setBusy(false);
       }
     },
